@@ -1,0 +1,1146 @@
+---
+title: "LGCP - Fires in Portugal (2020)"
+author: "Margarida Oliveira"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+## Introduction
+We will work with a dataset that contains information about forest fires in mainland Portugal, in the year 2020. We will define some two-dimensional LGCP models to analyze the pattern of fire occurrence, consedering the effect of some covariates.
+
+load libraries
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+	eval = TRUE,
+	message = FALSE,
+	warning = FALSE,
+	comment = " ",
+	include = TRUE,
+	tidy = TRUE
+)
+
+library(readxl)      # to read the .xlsx file
+library(ggplot2)     # use gg() to visualizations 
+library(sf)          # Manipulating spatial objects (shapefiles, etc.)
+library(sp)          # Necessary for some spatial objects
+library(spatstat)    # Models for spatial points
+library(dplyr)     # Manipulating data
+library(raster)      # Raster
+library(ggspatial)
+library(terra)       # other raster (vect, rast, etc.)
+library(writexl)     # export .xlsx
+library(viridis)     # scales of colors
+library(generics)
+library(RColorBrewer)
+library(fields)
+library(fmesher)
+library(spatstat.geom)
+library(gstat)
+library(data.table)
+
+knitr::opts_knit$set(root.dir = "C:/Users/.../UrbanFiresData-main")
+```
+
+## Install INLA
+```{r }
+#if not installed
+install.packages("INLA", repos = c("https://inla.r-inla-download.org/R/stable"), dep = TRUE)
+
+
+library(INLA)
+library(inlabru)     # Model LGCP
+
+# inlabru
+bru_safe_sp(force = TRUE)
+bru_options_set(control.compute = list(dic = TRUE)) # Activate DIC output
+```
+
+## Get the Data
+Shapefile _bound_ with Portugal's boundaries, separated into districts.
+```{r}
+#boundaries 
+bound <- st_read("shapefiles2/gadm36_PRT_1.shp")
+
+# shapefiles
+concelhos <- st_read("shapefiles/conc/concelhos/concelhos.shp") %>%
+  filter(!NAME_1 %in% c("Madeira", "Azores")) %>%
+  st_transform(crs = "+proj=tmerc +lat_0=39.66825833333333 +lon_0=-8.133108333333334 +k=1 +x_0=0
++y_0=0 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=km +no_defs")
+ 
+
+distritos <- st_read("distritos.shp") %>%
+  filter(!NAME_1 %in% c("Madeira", "Açores")) %>%
+  st_transform(crs = "+proj=tmerc +lat_0=39.66825833333333 +lon_0=-8.133108333333334 +k=1 +x_0=0
++y_0=0 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=km +no_defs")
+
+distritos <- distritos |> rename(district = NAME_1)
+```
+
+```{r }
+# corrections of bound names
+bound=bound[bound$NAME_1!="Azores",]
+bound=bound[bound$NAME_1!="Madeira",]
+
+bound <- st_transform(bound, crs = st_crs("+proj=tmerc +lat_0=39.66825833333333 +lon_0=-8.133108333333334 +k=1 +x_0=0 +y_0=0 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=km +no_defs"))
+```
+
+File _data_ with informations about the occurrences on Portugal in 2020: id, date, district, coordinates (lat/lon), type of vegetation, total burned area (ha), FWI and others informations.
+
+```{r dados}
+# Carregar dados de incêndios
+data <- read_excel("C:/Users/.../UrbanFiresData-main/2020_1.xlsx")
+```
+
+## Coordinates: lon and lat
+
+The following chunk combines the observations without considering the separation into districts and  the _data_ in the correct CRS:
+
+```{r bound}
+## Defining portuguese border
+bound_union_sf <- bound |>
+  st_union() |>              
+  st_sf(geometry = _) |>     
+  st_transform(crs = "+proj=tmerc +lat_0=39.66825833333333 +lon_0=-8.133108333333334 +k=1 +x_0=0
++y_0=0 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=km +no_defs")      
+
+## Portugal System Coordinates
+crs_pt <- st_crs("+proj=tmerc +lat_0=39.66825833333333 +lon_0=-8.133108333333334 +k=1 +x_0=0
++y_0=0 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=km +no_defs")
+
+bound_union_sf<- st_transform(bound_union_sf, crs = crs_pt)
+```
+
+
+Grid for covariates raters creation
+```{r}
+pt_owin <- as.owin(bound_union_sf)
+window<-pt_owin
+
+# Grid of points inside of window
+n_points <- 10  
+x <- seq(from = window$xrange[1], to = window$xrange[2], length.out = n_points)
+y <- seq(from = window$yrange[1], to = window$yrange[2], length.out = n_points)
+grid_points <- expand.grid(x = x, y = y)
+
+
+inside_points <- inside.owin(grid_points$x, grid_points$y, window)
+grid_points_inside <- grid_points[inside_points,]
+
+pt_grid_sf <- st_as_sf(grid_points_inside, coords = c("x", "y"), crs = crs_pt)
+
+pt_grid_sf <- st_join(pt_grid_sf, concelhos[, c("NAME_1", "NAME_2")])
+
+pt_grid_sf <- pt_grid_sf%>% rename(district = NAME_1,
+         municipality = NAME_2)
+
+
+pt_grid_final <- pt_grid_sf %>%
+  mutate(
+    x = st_coordinates(.)[,1],
+    y= st_coordinates(.)[,2]
+  ) %>%
+  st_drop_geometry()
+```
+
+Dataframe _loc_ with necessary informations about occurrences
+```{r }
+
+loc <- data[, c("district","municipality","lat", "lon","typeCause","type","FWI")] 
+loc <- data.frame(
+  district = as.factor(data$district),
+  municipality = as.factor(data$municipality),
+  lat = as.numeric(data$lat), 
+  lon = as.numeric(data$lon),
+  typeCause = as.factor(data$typeCause),
+  type = as.factor(data$type),
+  FWI = as.numeric(data$FWI)
+)
+
+
+loc_sf <- st_as_sf(loc, coords = c("lon", "lat"), crs = 4326)
+loc_sf <- st_transform(loc_sf, crs_pt)
+loc[, c("x", "y")] <- st_coordinates(loc_sf)
+
+loc_sf <- loc_sf %>%
+   mutate(district = gsub("Do", "do", district, fixed = TRUE))
+
+```
+
+
+### Data transformation
+FWI relativo
+```{r}
+# FWI limits per district
+limiares <- data.frame(
+  Distrito = c("Viana do Castelo", "Braga", "Porto", "Vila Real", "Bragança",
+               "Aveiro", "Viseu", "Guarda", "Coimbra", "Leiria", "Castelo Branco",
+               "Lisboa", "Santarém", "Setúbal", "Portalegre", "Évora", "Beja", "Faro"),
+  Baixo = c(10, 10, 8, 13, 23, 10, 15, 8, 15, 15, 20, 25, 25, 30, 35, 40, 40, 30),
+  Extremo = c(45, 50, 40, 50, 55, 40, 70, 50, 45, 50, 60, 70, 60, 70, 75, 75, 75, 75)
+)
+
+
+# FWI_RR
+loc_sf <- loc_sf %>%
+  left_join(limiares, by = c("district" = "Distrito")) %>%
+  mutate(
+   RR = (FWI - Baixo)/ (Extremo - Baixo))
+
+FWI_ <- mean(loc_sf$FWI, na.rm = TRUE)
+FWI_sd <- sd(loc_sf$FWI, na.rm = TRUE)
+
+loc_sf <- loc_sf %>%
+  mutate(FWI = (FWI - FWI_)/FWI_sd)
+```
+
+
+```{r}
+loc_df <- loc_sf %>%
+  st_drop_geometry() %>%
+  mutate(
+    x = st_coordinates(loc_sf)[,1],
+    y = st_coordinates(loc_sf)[,2]
+  )
+
+merged_data <- merge(pt_grid_final, loc_df, 
+                    by = c("x", "y","district","municipality"),
+                    all = TRUE,
+                    suffixes = c("_grid", "_incendio"))
+
+write_xlsx(merged_data, "pt_grid_cov.xlsx")
+grid_cov <- read_excel("pt_grid_cov.xlsx")
+grid_sf <- st_as_sf(grid_cov, coords = c("x", "y"), crs = crs_pt)
+
+```
+
+```{r}
+## Map with points where forest fires occur 
+ggplot(bound_union_sf) + geom_sf(fill = "gray", color = "black", alpha = 0.4) + 
+  annotation_scale(location = "bl", width_hint = 0.1, style = "ticks",line_width = 0.1) + 
+  gg(loc_sf, col = "darkred",shape = 1) +
+  coord_sf(datum = st_crs(bound_union_sf))
+```
+
+# Covariates Rasters
+```{r}
+raster_template <- rast(
+  extent = ext(bound_union_sf),
+  resolution = 1,
+  crs = "+proj=tmerc +lat_0=39.66825833333333 +lon_0=-8.133108333333334 +k=1 +x_0=0 +y_0=0 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=km +no_defs"
+)
+
+suppressWarnings({
+  raster_points <- as.points(raster_template) 
+  raster_points_sf <- st_as_sf(raster_points)  
+})
+ raster_points_sf <- st_as_sf(as.points(raster_template))
+
+st_crs(raster_points_sf) <- st_crs(grid_sf)
+```
+
+
+```{r}
+#### FWI raster
+
+# IDW Interpolation
+FWI_idw <- gstat::idw(
+  FWI ~ 1,
+  locations = grid_sf[!is.na(grid_sf$FWI), ], 
+  newdata = raster_points_sf,
+  nmax = 5,  
+  idp = 2   
+)
+
+r_fwi <- rasterize(
+  vect(FWI_idw),
+  raster_template,
+  field = "var1.pred"
+)
+
+portugal_vect <- vect(bound_union_sf)  
+r_fwi <- mask(r_fwi, portugal_vect) 
+
+plot(r_fwi, col=colorRampPalette(brewer.pal(9, "YlOrRd"))(256), main = "FWI"); plot(bound_union_sf, add=TRUE)+ annotation_scale(location = "bl", width_hint = 0.1, style = "ticks",line_width = 0.1)
+```
+
+
+```{r}
+#### FWI_rr raster
+
+RR_idw <- gstat::idw(
+  RR ~ 1,
+  locations = grid_sf[!is.na(grid_sf$RR), ],  
+  newdata = raster_points_sf,
+  nmax = 5,  
+  idp = 2    
+)
+
+r_rr <- rasterize(
+  vect(RR_idw),
+  raster_template,
+  field = "var1.pred"  
+)
+
+portugal_vect <- vect(bound_union_sf)  
+r_rr <- mask(r_rr, portugal_vect) 
+
+plot(r_rr, col=colorRampPalette(brewer.pal(9, "YlOrRd"))(256), main = "FWI (relativo)"); plot(bound_union_sf, add=TRUE)
+```
+
+
+```{r}
+#### Cause raster
+
+categories <- na.omit(unique(grid_sf$typeCause))
+ordem_correta <- c("Desconhecida","Reacendimento","Natural", "Negligente","Intencional") #you can change the priority
+categories <- factor(ordem_correta, levels = ordem_correta)
+
+grid_sf <- grid_sf %>%
+  mutate(
+    typeCause_fct = factor(typeCause, levels = categories),
+    typeCause_num = as.numeric(typeCause_fct) 
+  )
+
+
+cause_interp <- gstat::idw(
+  typeCause_num ~ 1,  
+  locations = grid_sf[!is.na(grid_sf$typeCause_num), ],
+  newdata = raster_points_sf,
+  nmax = 5, 
+  idp = 0    
+)
+
+
+cause_interp$var1.pred <- round(cause_interp$var1.pred)
+cause_interp$typeCause <- categories[cause_interp$var1.pred]
+
+
+r_cause <- rasterize(
+  vect(cause_interp),
+  raster_template,
+  field = "var1.pred"
+)
+
+
+values(r_cause) <- categories[values(r_cause)]
+
+
+r_cause <- mask(r_cause, vect(bound_union_sf))
+
+
+plot(r_cause, col=colorRampPalette(brewer.pal(9, "YlOrRd"))(256), main = "Tipo de Causa de Incêndio"); plot(bound_union_sf, add=TRUE)
+```
+
+
+```{r}
+## Vegetation type - raster
+
+categories_ty <- na.omit(unique(grid_sf$type))
+ordem_correta2 <- c("Agrícola", "Povoamento Florestal", "Mato")
+categories_ty <- factor(ordem_correta2, levels = ordem_correta2)
+
+grid_sf <- grid_sf %>%
+  mutate(
+    type_fct = factor(type, levels = categories_ty),
+    type_num = as.numeric(type_fct)
+  )
+
+
+ty_interp <- gstat::idw(
+  type_num ~ 1,  
+  locations = grid_sf[!is.na(grid_sf$type_num), ],
+  newdata = raster_points_sf,
+  nmax = 5,  
+  idp = 0    
+)
+
+ty_interp$var1.pred <- round(ty_interp$var1.pred)
+ty_interp$type <- categories_ty[ty_interp$var1.pred]
+
+
+r_type <- rasterize(
+  vect(ty_interp),
+  raster_template,
+  field = "type"  
+)
+
+
+r_type <- mask(r_type, vect(bound_union_sf))
+
+
+plot(r_type, col=colorRampPalette(brewer.pal(9, "YlOrRd"))(256), main = "Tipo de vegetação ardida"); plot(bound_union_sf, add=TRUE)
+```
+
+Data transformation for models with "dummy" covariate
+```{r}
+## We considerate new categories for  type of Cause, obtained by union of "Reacendimento" + "Natural" and "Intencional" + "Negligente"
+loc_sf <- loc_sf %>% mutate(typeCause = gsub("Reacendimento", "Natural", typeCause, fixed = TRUE))
+loc_sf <- loc_sf %>% mutate(typeCause = gsub("Intencional", "Negligente", typeCause, fixed = TRUE))
+
+## Names and order for the new type of cause categories
+loc_sf$typeCause <- factor(loc_sf$typeCause, labels = c("Outra", "Natural", "Posto"))
+loc_sf$typeCause <- factor(loc_sf$typeCause, levels = c("Natural", "Posto","Outra"))
+
+## Names and order for type of vegetation categories
+loc_sf$type <- factor(loc_sf$type, labels = c("Agrícola", "Mato", "Floresta"))
+loc_sf$type <- factor(loc_sf$type, levels = c("Mato", "Agrícola", "Floresta"))
+```
+
+## Mesh
+Creation of a triangular mesh ( _mesh inc_ ) that serves to approximate the spatial Gaussian random field used in the LGCP (Log-Gaussian Cox Process) model.
+
+```{r }
+coords <- st_coordinates(grid_sf) 
+max.edge <- diff(range(coordinates(coords)[, 1])) / (3 * 5)
+bound.outer <- diff(range(coordinates(coords)[, 1])) / 3
+
+mesh_inc <- inla.mesh.2d(
+  loc = coords,
+  boundary = bound_union_sf,
+  max.edge = c(1, 5) * max.edge,
+  offset = c(max.edge, bound.outer),
+  cutoff = max.edge / 3,
+  crs = crs_pt
+)
+
+
+plot(mesh_inc)
+```
+
+
+## Fitting Models
+```{r }
+## Linear covariates (rasters)
+fwi <- r_fwi |> raster() |> scale()
+fwi_spdf <- fwi |> as("SpatialGridDataFrame") |> as("SpatialPixelsDataFrame")
+
+rr <- r_rr |> raster() |> scale()
+rr_spdf <- rr |> as("SpatialGridDataFrame") |> as("SpatialPixelsDataFrame")
+
+cause <- r_cause |> raster() |> scale()
+cause_spdf <- cause |> as("SpatialGridDataFrame") |> as("SpatialPixelsDataFrame")
+
+type <- r_type |> raster() |> scale()
+type_spdf <- type |> as("SpatialGridDataFrame") |> as("SpatialPixelsDataFrame")
+
+
+## Matrix with 'dummy' coding for the covariate "cause"
+dmat_cause <- model.matrix(~typeCause, loc_sf)[,-1]
+## Matrix with 'dummy' coding for the covariate "vegetation" 
+dmat_ty <- model.matrix(~type, loc_sf)[,-1]
+
+
+## Matérn Model
+matern <- inla.spde2.pcmatern(
+  mesh_inc,
+  prior.sigma = c(1 , 0.01), 
+  prior.range = c(65, 0.9) 
+)
+
+## Formulas (linear effects)
+compS <- geometry ~  field(geometry, model = matern) +Intercept(1)
+
+compF <- geometry ~  0+ Intercept(1) + rr_spdf + 
+                    field(geometry, model = matern)
+
+comp1 <- geometry ~ 0+ Intercept(1) + fwi_spdf + 
+                    field(geometry, model = matern)
+
+comp2 <- geometry ~ 0+ Intercept(1) + type_spdf +
+                    field(geometry, model = matern)
+
+comp3 <- geometry ~ 0+ Intercept(1) + cause_spdf +
+                    field(geometry, model = matern)
+
+comp4 <- geometry ~ 0+ Intercept(1) + fwi_spdf + cause_spdf +  
+                    field(geometry, model = matern)
+
+comp5 <- geometry ~ 0+ Intercept(1) + fwi_spdf + type_spdf + 
+                    field(geometry, model = matern)
+
+comp6 <- geometry ~ 0+ Intercept(1) + cause_spdf+ type_spdf+  
+                    field(geometry, model = matern)
+
+comp7 <- geometry ~ 0+ Intercept(1) + fwi_spdf + cause_spdf+ type_spdf+ 
+                    field(geometry, model = matern)
+
+
+## Formulas ('dummy' effects)
+ comp2_ <- geometry ~ 0+ Intercept(1) + typeAgrícola + typeFloresta +
+                    field(geometry, model = matern)
+ 
+ comp3_ <- geometry ~ 0+ Intercept(1) + typeCausePosto + typeCauseOutra +
+                    field(geometry, model = matern)
+ 
+ comp4_ <- geometry ~ 0+ Intercept(1) + fwi_spdf + typeCausePosto + typeCauseOutra +
+                    field(geometry, model = matern)
+ 
+ comp5_ <- geometry ~ 0+ Intercept(1) + fwi_spdf + typeAgrícola + typeFloresta +
+                    field(geometry, model = matern)
+ 
+ comp6_ <- geometry ~ 0+ Intercept(1) + (typeAgrícola + typeFloresta) + 
+                    (typeCausePosto +  typeCauseOutra) +
+                    field(geometry, model = matern)
+ 
+ comp7_ <- geometry ~ 0+ Intercept(1) + fwi_spdf + (typeAgrícola + typeFloresta) + 
+                    (typeCausePosto +  typeCauseOutra) +
+                    field(geometry, model = matern)
+ 
+## Fits (linear effects)
+fitS <- lgcp(compS, loc_sf, samplers = bound_union_sf, domain = list(geometry = mesh_inc))
+fit1 <- lgcp(comp1, loc_sf, samplers = bound_union_sf, domain = list(geometry = mesh_inc))
+fit2 <- lgcp(comp2, loc_sf, samplers = bound_union_sf, domain = list(geometry = mesh_inc))
+fit3 <- lgcp(comp3, loc_sf, samplers = bound_union_sf, domain = list(geometry = mesh_inc))
+fit4 <- lgcp(comp4, loc_sf, samplers = bound_union_sf, domain = list(geometry = mesh_inc))
+fit5 <- lgcp(comp5, loc_sf, samplers = bound_union_sf, domain = list(geometry = mesh_inc))
+fit6 <- lgcp(comp6, loc_sf, samplers = bound_union_sf, domain = list(geometry = mesh_inc))
+fit7 <- lgcp(comp7, loc_sf, samplers = bound_union_sf, domain = list(geometry = mesh_inc))
+fitF <- lgcp(compF, loc_sf, samplers = bound_union_sf, domain = list(geometry = mesh_inc))
+
+## Fits ('dummy' effects)
+fit2_ <- lgcp(comp2_, cbind(loc_sf,dmat_ty), samplers = bound_union_sf, domain = list(geometry = mesh_inc))
+fit3_ <- lgcp(comp3_, cbind(loc_sf,dmat_cause), samplers = bound_union_sf, domain = list(geometry = mesh_inc))
+fit4_ <- lgcp(comp4_, cbind(loc_sf,dmat_cause), samplers = bound_union_sf, domain = list(geometry = mesh_inc))
+fit5_ <- lgcp(comp5_, cbind(loc_sf,dmat_ty), samplers = bound_union_sf, domain = list(geometry = mesh_inc))
+    
+         #fit6_ <- lgcp(comp6_, cbind(loc_sf,dmat_ty,dmat_cause), samplers = bound_union_sf, 
+          #    domain = list(geometry = mesh_inc))
+         #fit7_ <- lgcp(comp7_, cbind(loc_sf,dmat_ty,dmat_cause), samplers = bound_union_sf, 
+          #    domain = list(geometry = mesh_inc))
+
+```
+
+SPDE parameter posteriors and the Matern correlation and covariance functions for ModeloS
+```{r }
+spde.range <- spde.posterior(fitS, "field", what = "range")
+spde.logvar <- spde.posterior(fitS, "field", what = "variance")
+range.plot <- plot(spde.range)
+var.plot <- plot(spde.logvar)
+
+p1 <- range.plot + xlab("Alcance (km)") + ylab("Densidade") + theme_minimal()
+p2 <- var.plot + xlab("Variância") + ylab("Densidade") + theme_minimal()
+
+multiplot(p1,p2, col = 2)
+```
+
+```{r}
+corplot <- plot(spde.posterior(fitS, "field", what = "matern.correlation"))
+covplot <- plot(spde.posterior(fitS, "field", what = "matern.covariance"))
+multiplot(covplot, corplot)
+corplot + xlab("Distância entre pontos (km)") + ylab("Probabilidade de correlação entre pontos") + theme_minimal()
+```
+
+
+## Predicting intensity and Posterior mean maps
+
+Points where the forecast will be made
+```{r}
+pix <- fm_pixels(mesh_inc, mask = bound_union_sf, format = "sf") #format = "sf"
+```
+
+
+#######################
+ModeloS
+
+````{r}
+intS <- predict(fitS, pix, ~ exp(field + Intercept))
+log.intS <- predict(fitS, pix, ~ field)
+
+gS1 <-ggplot() +
+  gg(log.intS, aes(fill = mean), geom = "tile") +
+  gg(bound_union_sf, alpha = 0, lwd = 0.1) + coord_sf(datum = st_crs(bound_union_sf))+
+  theme(legend.position = "bottom") +
+  #gg(loc_sf, color = "black", cex = 0.5,shape = 1)+
+  scale_fill_gradientn(colors = colorRampPalette(brewer.pal(9, "YlOrRd"))(256))+ #,limits= c(-2.2, 5)
+  labs(fill = "valor")+
+  ggtitle("[A]")
+
+# Intensity pattern map
+gS2 <-ggplot() +
+  gg(intS, aes(fill = mean), geom = "tile") +
+  gg(bound_union_sf, alpha = 0, lwd = 0.1) + coord_sf(datum = st_crs(bound_union_sf))+
+  theme(legend.position = "bottom") +
+  #gg(loc_sf, color = "black", cex = 0.5,shape = 1)+
+  scale_fill_gradientn(colors = colorRampPalette(c("#4B0082", "#FF4500", "#FFD700"))(256), limits = c(0,6))+
+  labs(fill = "valor")+
+  ggtitle("[A]")
+
+plot(gS1)
+plot(gS2)
+```
+
+Intensity (mean) per _km_
+```{r}
+range(intS$mean) # IC_95% (mean values)
+mean(intS$mean) # mean value
+```
+
+```{r}
+summary(fitS)
+```
+
+Predict Intensity (year)
+```{r}
+LambdaS <- predict(
+  fitS,
+  fm_int(mesh_inc, bound_union_sf),
+  ~ sum(weight * exp(field + Intercept))
+)
+LambdaS
+```
+
+
+######################################
+
+ModeloC1 (FWI)
+````{r}
+int1_I <- predict(fit1, pix, ~ exp(fwi_spdf + field + Intercept))
+log.fwi1 <- predict(fit1, pix, ~ fwi_spdf)
+log.fwi11 <- predict(fit1, pix, ~ fwi_spdf + field)
+log.fwi111 <- predict(fit1, pix, ~ field)
+
+g11 <-ggplot() +
+  gg(log.fwi11, aes(fill = mean), geom = "tile") +
+  gg(bound_union_sf, alpha = 0, lwd = 0.1) + coord_sf(datum = st_crs(bound_union_sf))+
+  theme(legend.position = "bottom") +
+  #gg(loc_sf, color = "black", cex = 0.5,shape = 1)+
+  scale_fill_gradientn(colors = colorRampPalette(brewer.pal(9, "YlOrRd"))(256), limits = c(-2.2,5))+ 
+  labs(fill = "valor")+
+  ggtitle("[A]")
+       
+
+g12 <-ggplot() +
+  gg(log.fwi111, aes(fill = mean), geom = "tile") +
+  gg(bound_union_sf, alpha = 0, lwd = 0.1) + coord_sf(datum = st_crs(bound_union_sf))+
+  theme(legend.position = "bottom") +
+  #gg(loc_sf, color = "black", cex = 0.5,shape = 1)+
+  scale_fill_gradientn(colors = colorRampPalette(brewer.pal(9, "YlOrRd"))(256), limits = c(-2.2,5))+
+  labs(fill = "valor")+
+  ggtitle("[B]")
+
+g13 <-ggplot() +
+  gg(log.fwi1, aes(fill = mean), geom = "tile") +
+  gg(bound_union_sf, alpha = 0, lwd = 0.1) + coord_sf(datum = st_crs(bound_union_sf))+
+  theme(legend.position = "bottom") +
+  #gg(loc_sf, color = "black", cex = 0.5,shape = 1)+
+  scale_fill_gradientn(colors = colorRampPalette(brewer.pal(9, "YlOrRd"))(256), limits = c(-2.2,5))+
+  labs(fill = "valor")+
+  ggtitle("[C]")
+
+# Intensity pattern map     
+g14 <-ggplot() +
+  gg(int1_I, aes(fill = mean), geom = "tile") +
+  gg(bound_union_sf, alpha = 0, lwd = 0.1) + coord_sf(datum = st_crs(bound_union_sf))+
+  theme(legend.position = "bottom") +
+  #gg(loc_sf, color = "black", cex = 0.5,shape = 1)+
+  scale_fill_gradientn(colors = colorRampPalette(c("#4B0082", "#FF4500", "#FFD700"))(256), limits = c(0,6))+
+  labs(fill = "valor")+
+  ggtitle("[B]")
+
+multiplot(g11,g12,gl3, cols = 3)
+
+```
+
+```{r}
+plot(g14)
+```
+
+```{r}
+range(int1_I$mean)
+mean(int1_I$mean) 
+```
+
+```{r}
+summary(fit1)
+```
+
+```{r}
+Lambda1 <- predict(
+  fit1,
+  fm_int(mesh_inc, bound_union_sf),
+  ~ sum(weight * exp(fwi_spdf + field + Intercept))
+)
+Lambda1
+```
+
+
+###########################################
+ModeloC2 - Vegetation
+
+```{r}
+int2 <- predict(fit2, pix, ~ exp(type_spdf + field + Intercept))
+log.int2 <- predict(fit2, pix, ~ type_spdf + field)
+log.int22 <- predict(fit2, pix, ~ type_spdf)
+log.int222 <- predict(fit2, pix, ~ field)
+
+
+g21 <-ggplot() +
+  gg(log.int2, aes(fill = mean), geom = "tile") +
+  gg(bound_union_sf, alpha = 0, lwd = 0.1) + coord_sf(datum = st_crs(bound_union_sf))+ 
+  theme(legend.position = "bottom") +
+  #gg(loc_sf, color = "black", cex = 0.5,shape = 1)+
+  scale_fill_gradientn(colors = colorRampPalette(brewer.pal(9, "YlOrRd"))(256))+
+  labs(fill = "valor")+
+  ggtitle("[A]")
+
+
+g22 <-ggplot() +
+  gg(log.int222, aes(fill = mean), geom = "tile") +
+  gg(bound_union_sf, alpha = 0, lwd = 0.1) + coord_sf(datum = st_crs(bound_union_sf))+ 
+  theme(legend.position = "bottom") +
+  #gg(loc_sf, color = "black", cex = 0.5,shape = 1)+
+  scale_fill_gradientn(colors = colorRampPalette(brewer.pal(9, "YlOrRd"))(256))+
+  labs(fill = "valor")+
+  ggtitle("[B]")
+
+g23 <-ggplot() +
+  gg(log.int22, aes(fill = mean), geom = "tile") +
+  gg(bound_union_sf, alpha = 0, lwd = 0.1) + coord_sf(datum = st_crs(bound_union_sf))+ 
+  theme(legend.position = "bottom") +
+  #gg(loc_sf, color = "black", cex = 0.5,shape = 1)+
+  scale_fill_gradientn(colors = colorRampPalette(brewer.pal(9, "YlOrRd"))(256))+
+  labs(fill = "valor")+
+  ggtitle("[C]")
+
+# Intensity pattern map
+g24 <-ggplot() +
+  gg(int2, aes(fill = mean), geom = "tile") +
+  gg(bound_union_sf, alpha = 0, lwd = 0.1) + coord_sf(datum = st_crs(bound_union_sf))+
+  theme(legend.position = "bottom") +
+  #gg(loc_sf, color = "black", cex = 0.5,shape = 1)+
+  scale_fill_gradientn(colors = colorRampPalette(c("#4B0082", "#FF4500", "#FFD700"))(256), limits = c(0,6))+
+  labs(fill = "valor") +
+  ggtitle("[C]")
+
+multiplot(g21,g22,g23, cols = 3)
+```
+
+```{r}
+plot(g24)
+```
+
+```{r}
+range(int2$mean) 
+mean(int2$mean) 
+```
+
+```{r}
+summary(fit2)
+```
+
+```{r}
+Lambda2 <- predict(
+  fit2,
+  fm_int(mesh_inc, bound_union_sf),
+  ~ sum(weight * exp(type_spdf + field + Intercept))
+)
+Lambda2
+```
+
+
+#####################################
+ModeloC3 - Cause
+```{r}
+int3 <- predict(fit3, pix, ~ exp(cause_spdf + field+Intercept))
+log.int3 <- predict(fit3, pix, ~ cause_spdf + field)
+log.int33 <- predict(fit3, pix, ~ cause_spdf)
+log.int333 <- predict(fit3, pix, ~ field)
+
+g31 <-ggplot() +
+  gg(log.int3, aes(fill = mean), geom = "tile") +
+  gg(bound_union_sf, alpha = 0, lwd = 0.1) + coord_sf(datum = st_crs(bound_union_sf))+ 
+  theme(legend.position = "bottom") +
+  #gg(loc_sf, color = "black", cex = 0.5,shape = 1)+
+  scale_fill_gradientn(colors = colorRampPalette(brewer.pal(9, "YlOrRd"))(256), limits = c(-2.3, 5))+ 
+  labs(fill = "valor")+
+  ggtitle("[A]")
+
+g32 <-ggplot() +
+  gg(log.int333, aes(fill = mean), geom = "tile") +
+  gg(bound_union_sf, alpha = 0, lwd = 0.1) + coord_sf(datum = st_crs(bound_union_sf))+ 
+  theme(legend.position = "bottom") +
+  #gg(loc_sf, color = "black", cex = 0.5,shape = 1)+
+  scale_fill_gradientn(colors = colorRampPalette(brewer.pal(9, "YlOrRd"))(256), limits = c(-2.3, 5))+
+  labs(fill = "valor")+
+  ggtitle("[B]")
+
+g33 <-ggplot() +
+  gg(log.int33, aes(fill = mean), geom = "tile") +
+  gg(bound_union_sf, alpha = 0, lwd = 0.1) + coord_sf(datum = st_crs(bound_union_sf))+ 
+  theme(legend.position = "bottom") +
+  #gg(loc_sf, color = "black", cex = 0.5,shape = 1)+
+  scale_fill_gradientn(colors = colorRampPalette(brewer.pal(9, "YlOrRd"))(256), limits = c(-2.1, 4.1))+
+  labs(fill = "valor")+
+  ggtitle("[C]")
+
+multiplot(g31, g32,g33, cols = 3)
+```
+
+```{r}
+range(int3$mean) 
+mean(int3$mean)
+```
+
+```{r}
+summary(fit3)
+```
+
+```{r}
+Lambda3 <- predict(
+  fit3,
+  fm_int(mesh_inc, bound_union_sf),
+  ~ sum(weight * exp(cause_spdf + field+Intercept))
+)
+Lambda3
+```
+
+
+#######################
+ModeloC4 - FWI + Cause
+
+```{r}
+int4 <- predict(fit4, pix, ~ exp(fwi_spdf + cause_spdf + field + Intercept))
+log.int4 <- predict(fit4, pix, ~ fwi_spdf + cause_spdf + field)
+log.int44 <- predict(fit4, pix, ~ fwi_spdf + cause_spdf)
+log.int444 <- predict(fit4, pix, ~ field)
+
+g41 <-ggplot() +
+  gg(log.int4, aes(fill = mean), geom = "tile") +
+  gg(bound_union_sf, alpha = 0, lwd = 0.1) + coord_sf(datum = st_crs(bound_union_sf))+
+  theme(legend.position = "bottom") +
+  #gg(loc_sf, color = "black", cex = 0.5,shape = 1)+
+  scale_fill_gradientn(colors = colorRampPalette(brewer.pal(9, "YlOrRd"))(256), limits = c(-2.4,4.6))+
+  labs(fill = "valor")+
+  ggtitle("[A]")
+
+g42 <- ggplot() +
+  gg(log.int444, aes(fill = mean), geom = "tile") +
+  gg(bound_union_sf, alpha = 0, lwd = 0.1) + coord_sf(datum = st_crs(bound_union_sf))+
+  theme(legend.position = "bottom") +
+  #gg(loc_sf, color = "black", cex = 0.5,shape = 1)+
+  scale_fill_gradientn(colors = colorRampPalette(brewer.pal(9, "YlOrRd"))(256), limits = c(-2.4,4.6))+
+  labs(fill = "valor")+
+  ggtitle("[B]")
+
+g43 <- ggplot() +
+  gg(log.int44, aes(fill = mean), geom = "tile") +
+  gg(bound_union_sf, alpha = 0, lwd = 0.1) + coord_sf(datum = st_crs(bound_union_sf))+
+  theme(legend.position = "bottom") +
+  #gg(loc_sf, color = "black", cex = 0.5,shape = 1)+
+  scale_fill_gradientn(colors = colorRampPalette(brewer.pal(9, "YlOrRd"))(256), limits = c(-1,1))+
+  labs(fill = "valor")+
+  ggtitle("[C]")
+
+# Intensity pattern map
+g44 <-ggplot() +
+  gg(int4, aes(fill = mean), geom = "tile") +
+  gg(bound_union_sf, alpha = 0, lwd = 0.1) + coord_sf(datum = st_crs(bound_union_sf))+
+  theme(legend.position = "bottom") +
+  #gg(loc_sf, color = "black", cex = 0.5,shape = 1)+
+  scale_fill_gradientn(colors = colorRampPalette(c("#4B0082", "#FF4500", "#FFD700"))(256), limits = c(0,6))+
+  labs(fill = "valor")+
+  ggtitle("[E]")
+
+multiplot(g41,g42,g43, cols = 3)
+```
+
+```{r}
+plot(g44)
+```
+
+```{r}
+range(int4$mean)
+mean(int4$mean) 
+```
+
+```{r}
+summary(fit4)
+```
+
+```{r}
+Lambda4 <- predict(
+  fit4,
+  fm_int(mesh_inc, bound_union_sf),
+  ~ sum(weight * exp(fwi_spdf + cause_spdf + field + Intercept))
+)
+Lambda4
+```
+
+
+##########################################
+ModeloC5 - FWI + Vegetation
+
+```{r}
+int5 <- predict(fit5, pix, ~ exp(fwi_spdf + type_spdf + field + Intercept))
+
+log.int5 <- predict(fit5, pix, ~ fwi_spdf + type_spdf + field)
+log.int55 <- predict(fit5, pix, ~ fwi_spdf + type_spdf)
+log.int555 <- predict(fit5, pix, ~ field)
+
+g51 <-ggplot() +
+  gg(log.int5, aes(fill = mean), geom = "tile") +
+  gg(bound_union_sf, alpha = 0, lwd = 0.1) + coord_sf(datum = st_crs(bound_union_sf))+
+  theme(legend.position = "bottom") +
+  #gg(loc_sf, color = "black", cex = 0.5,shape = 1)+
+  scale_fill_gradientn(colors = colorRampPalette(brewer.pal(9, "YlOrRd"))(256), limits = c(-2.4,5))+
+  labs(fill = "valor")+
+  ggtitle("[A]")
+
+g52 <- ggplot() +
+  gg(log.int555, aes(fill = mean), geom = "tile") +
+  gg(bound_union_sf, alpha = 0, lwd = 0.1) + coord_sf(datum = st_crs(bound_union_sf))+
+  theme(legend.position = "bottom") +
+  #gg(loc_sf, color = "black", cex = 0.5,shape = 1)+
+  scale_fill_gradientn(colors = colorRampPalette(brewer.pal(9, "YlOrRd"))(256), limits = c(-2.4,5))+
+  labs(fill = "valor")+
+  ggtitle("[B]")
+
+
+g53 <-ggplot() +
+  gg(log.int55, aes(fill = mean), geom = "tile") +
+  gg(bound_union_sf, alpha = 0, lwd = 0.1) + coord_sf(datum = st_crs(bound_union_sf))+
+  theme(legend.position = "bottom") +
+  #gg(loc_sf, color = "black", cex = 0.5,shape = 1)+
+  scale_fill_gradientn(colors = colorRampPalette(brewer.pal(9, "YlOrRd"))(256), limits = c(-2.4,5))+
+  labs(fill = "valor")+
+  ggtitle("[C]")
+
+multiplot(g51,g52,g53, cols = 3)
+```
+
+```{r}
+range(int5$mean)  
+mean(int5$mean) 
+```
+
+```{r}
+Lambda5 <- predict(
+  fit5,
+  fm_int(mesh_inc, bound_union_sf),
+  ~ sum(weight * exp(fwi_spdf + type_spdf + field + Intercept))
+)
+Lambda5
+```
+
+
+#################################
+ModeloC6 - Cause + Vegetation
+
+```{r}
+int6 <- predict(fit6, pix, ~ exp(type_spdf + cause_spdf + field + Intercept))
+
+log.int6 <- predict(fit6, pix, ~ type_spdf + cause_spdf + field)
+log.int66 <- predict(fit6, pix, ~ type_spdf + cause_spdf)
+log.int666 <- predict(fit6, pix, ~ field)
+
+g61 <-ggplot() +
+  gg(log.int6, aes(fill = mean), geom = "tile") +
+  gg(bound_union_sf, alpha = 0, lwd = 0.1) + coord_sf(datum = st_crs(bound_union_sf))+
+  theme(legend.position = "bottom") +
+  #gg(loc_sf, color = "black", cex = 0.5,shape = 1)+
+  scale_fill_gradientn(colors = colorRampPalette(brewer.pal(9, "YlOrRd"))(256), limits = c(-2.3, 5))+
+  labs(fill = "valor")+
+  ggtitle("[A]")
+
+g62 <-ggplot() +
+  gg(log.int666, aes(fill = mean), geom = "tile") +
+  gg(bound_union_sf, alpha = 0, lwd = 0.1) + coord_sf(datum = st_crs(bound_union_sf))+
+  theme(legend.position = "bottom") +
+  #gg(loc_sf, color = "black", cex = 0.5,shape = 1)+
+  scale_fill_gradientn(colors = colorRampPalette(brewer.pal(9, "YlOrRd"))(256), limits = c(-2.3, 5))+
+  labs(fill = "valor")+
+  ggtitle("[B]")
+
+g63 <-ggplot() +
+  gg(log.int66, aes(fill = mean), geom = "tile") +
+  gg(bound_union_sf, alpha = 0, lwd = 0.1) + coord_sf(datum = st_crs(bound_union_sf))+
+  theme(legend.position = "bottom") +
+  #gg(loc_sf, color = "black", cex = 0.5,shape = 1)+
+  scale_fill_gradientn(colors = colorRampPalette(brewer.pal(9, "YlOrRd"))(256), limits = c(-2.3, 5))+
+  labs(fill = "valor")+
+  ggtitle("[C]")
+
+# Intensity pattern map
+g64 <-ggplot() +
+  gg(int6, aes(fill = mean), geom = "tile") +
+  gg(bound_union_sf, alpha = 0, lwd = 0.1) + coord_sf(datum = st_crs(bound_union_sf))+
+  theme(legend.position = "bottom") +
+  #gg(loc_sf, color = "black", cex = 0.5,shape = 1)+
+  scale_fill_gradientn(colors = colorRampPalette(c("#4B0082", "#FF4500", "#FFD700"))(256), limits = c(0,6))+
+  labs(fill = "valor")+
+  ggtitle("[E]")
+
+multiplot(g61,g62,g63, cols = 3)
+```
+
+```{r}
+range(int6$mean) 
+mean(int6$mean) 
+```
+
+```{r}
+summary(fit6)
+```
+
+```{r}
+Lambda6 <- predict(
+  fit6,
+  fm_int(mesh_inc, bound_union_sf),
+  ~ sum(weight * exp(type_spdf + cause_spdf + field + Intercept))
+)
+Lambda6
+```
+
+
+#######################
+ModeloC7 - FWI + cause + vegetation
+
+```{r}
+int7 <- predict(fit7, pix, ~ exp(fwi_spdf + type_spdf + cause_spdf + field + Intercept))
+
+log.int7 <- predict(fit7, pix, ~ fwi_spdf + type_spdf + cause_spdf + field)
+log.int77 <- predict(fit7, pix, ~ fwi_spdf + type_spdf + cause_spdf)
+log.int777 <- predict(fit7, pix, ~ field)
+
+g71 <-ggplot() +
+  gg(log.int7, aes(fill = mean), geom = "tile") +
+  gg(bound_union_sf, alpha = 0, lwd = 0.1) + coord_sf(datum = st_crs(bound_union_sf))+
+  theme(legend.position = "bottom") +
+  #gg(loc_sf, color = "black", cex = 0.5,shape = 1)+
+  scale_fill_gradientn(colors = colorRampPalette(brewer.pal(9, "YlOrRd"))(256), limits = c(-2.3, 4.5))+
+  labs(fill = "valor")+
+  ggtitle("[A]")
+
+g72 <-ggplot() +
+  gg(log.int777, aes(fill = mean), geom = "tile") +
+  gg(bound_union_sf, alpha = 0, lwd = 0.1) + coord_sf(datum = st_crs(bound_union_sf))+
+  theme(legend.position = "bottom") +
+  #gg(loc_sf, color = "black", cex = 0.5,shape = 1)+
+  scale_fill_gradientn(colors = colorRampPalette(brewer.pal(9, "YlOrRd"))(256), limits = c(-2.3, 4.5))+
+  labs(fill = "valor")+
+  ggtitle("[B]")
+
+g73 <-ggplot() +
+  gg(log.int77, aes(fill = mean), geom = "tile") +
+  gg(bound_union_sf, alpha = 0, lwd = 0.1) + coord_sf(datum = st_crs(bound_union_sf))+
+  theme(legend.position = "bottom") +
+  #gg(loc_sf, color = "black", cex = 0.5,shape = 1)+
+  scale_fill_gradientn(colors = colorRampPalette(brewer.pal(9, "YlOrRd"))(256), limits = c(-2.3, 4.5))+
+  labs(fill = "valor")+
+  ggtitle("[C]")
+
+# Intensity pattern map
+g74 <-ggplot() +
+  gg(intF, aes(fill = mean), geom = "tile") +
+  gg(bound_union_sf, alpha = 0, lwd = 0.1) + coord_sf(datum = st_crs(bound_union_sf))+
+  theme(legend.position = "bottom") +
+  #gg(loc_sf, color = "black", cex = 0.5,shape = 1)+
+  scale_fill_gradientn(colors = colorRampPalette(c("#4B0082", "#FF4500", "#FFD700"))(256), limits = c(0,6))+
+  labs(fill = "valor")+
+  ggtitle("[E]")
+
+multiplot(g71,g72,g73, cols = 3)
+```
+
+```{r}
+plot(g74)
+```
+
+```{r}
+range(int7$mean) 
+mean(int7$mean)
+```
+
+```{r}
+summary(fit7)
+```
+
+```{r}
+Lambda7 <- predict(
+  fit7,
+  fm_int(mesh_inc, bound_union_sf),
+  ~ sum(weight * exp(fwi_spdf + type_spdf + cause_spdf + field + Intercept))
+)
+Lambda7
+```
+
+
+####################
+ModeloF - FWI_rr
+
+````{r}
+intFI <- predict(fitF, pix, ~ exp(rr_spdf + field + Intercept))
+log.intF <- predict(fitF, pix, ~ rr_spdf + field)
+log.intFF <- predict(fitF, pix, ~ rr_spdf)
+log.intFFF <- predict(fitF, pix, ~ field)
+
+gF1 <-ggplot() +
+  gg(log.intF, aes(fill = mean), geom = "tile") +
+  gg(bound_union_sf, alpha = 0, lwd = 0.1) + coord_sf(datum = st_crs(bound_union_sf))+
+  theme(legend.position = "bottom") +
+  #gg(loc_sf, color = "black", cex = 0.5,shape = 1)+
+  scale_fill_gradientn(colors = colorRampPalette(brewer.pal(9, "YlOrRd"))(256))+
+  labs(fill = "valor")+
+  ggtitle("[A]")
+
+gF2 <-ggplot() +
+  gg(log.intFFF, aes(fill = mean), geom = "tile") +
+  gg(bound_union_sf, alpha = 0, lwd = 0.1) + coord_sf(datum = st_crs(bound_union_sf))+
+  theme(legend.position = "bottom") +
+  #gg(loc_sf, color = "black", cex = 0.5,shape = 1)+
+  scale_fill_gradientn(colors = colorRampPalette(brewer.pal(9, "YlOrRd"))(256))+
+  labs(fill = "valor")+
+  ggtitle("[B]")
+
+gF3 <-ggplot() +
+  gg(log.intFF, aes(fill = mean), geom = "tile") +
+  gg(bound_union_sf, alpha = 0, lwd = 0.1) + coord_sf(datum = st_crs(bound_union_sf))+
+  theme(legend.position = "bottom") +
+  #gg(loc_sf, color = "black", cex = 0.5,shape = 1)+
+  scale_fill_gradientn(colors = colorRampPalette(brewer.pal(9, "YlOrRd"))(256), limits = c(-2.4,4.3))+#, limits = c(0,6)
+  labs(fill = "valor")+
+  ggtitle("[C]") 
+
+# Intensity pattern map
+gF4 <-ggplot() +
+  gg(intFI, aes(fill = mean), geom = "tile") +
+  gg(bound_union_sf, alpha = 0, lwd = 0.1) + coord_sf(datum = st_crs(bound_union_sf))+
+  theme(legend.position = "bottom") +
+  #gg(loc_sf, color = "black", cex = 0.5,shape = 1)+
+  scale_fill_gradientn(colors = colorRampPalette(c("#4B0082", "#FF4500", "#FFD700"))(256), limits = c(0,6))+#, limits = c(0,6)
+  labs(fill = "valor")+
+  ggtitle("[F]") 
+
+
+multiplot(gF1,gF2,gF3, cols = 3)
+```
+
+```{r}
+plot(gF4)
+```
+
+```{r}
+range(intFI$mean) 
+mean(intFI$mean) 
+```
+
+```{r}
+summary(fitF)
+```
+
+```{r}
+LambdaF <- predict(
+  fitF,
+  fm_int(mesh_inc, bound_union_sf),
+  ~ sum(weight * exp(rr_spdf + field + Intercept))
+)
+LambdaF
+```
+
+
+######################################################
+## Model comparison - DIC
+
+```{r}
+knitr::kable(deltaIC(fitS, fit1,fit2, fit3, fit4,fit5,fit6,fit7,fitF, criterion = c("DIC")))
+```
